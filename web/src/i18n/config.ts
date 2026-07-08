@@ -33,4 +33,4 @@ function isLocale(value: string | undefined): value is Locale {
 
 const envDefault = process.env.NEXT_PUBLIC_DEFAULT_LOCALE;
 
-export const DEFAULT_LOCALE: Locale = isLocale(envDefault) ? envDefault : "en";
+export const DEFAULT_LOCALE: Locale = isLocale(envDefault) ? envDefault : "zh-CN";
