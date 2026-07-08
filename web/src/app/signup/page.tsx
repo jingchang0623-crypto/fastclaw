@@ -50,7 +50,7 @@ export default function SignupPage() {
         return;
       }
       // Server set the session cookie on us; head to the app.
-      router.replace("/overview/");
+      router.replace("/team/");
     } catch {
       setError(t("errorCannotReachServer"));
       setLoading(false);

@@ -127,7 +127,7 @@ export default function OnboardPage() {
     let cancelled = false;
     getStatus()
       .then((s) => {
-        if (!cancelled && s?.configured) router.replace("/overview/");
+        if (!cancelled && s?.configured) router.replace("/team/");
       })
       .catch(() => {});
     return () => {

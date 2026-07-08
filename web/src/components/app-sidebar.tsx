@@ -38,6 +38,7 @@ import {
   getChatSessions,
   getMe,
   getStatus,
+  listAgentChannels,
   listProjects,
   type MeResponse,
   type ProjectEntry,
@@ -78,6 +79,16 @@ const OVERVIEW_ITEM = (t: NavTranslator): NavItem => ({
   title: t("overview"),
   url: "/overview/",
   icon: LayoutDashboardIcon,
+});
+
+// Team ("我的团队") is the post-login landing page. The badge carries
+// the count of employees still missing a WeChat binding — the single
+// retention-critical action we nudge everywhere.
+const TEAM_ITEM = (t: NavTranslator, unbound: number): NavItem => ({
+  title: t("team"),
+  url: "/team/",
+  icon: UsersIcon,
+  badge: unbound,
 });
 
 const USER_AGENT_GROUP = (t: NavTranslator): NavItem[] => [
@@ -149,6 +160,10 @@ export function AppSidebar(props: React.ComponentProps<typeof Sidebar>) {
   const [agentRoles, setAgentRoles] = React.useState<Record<string, "owner" | "viewer">>({});
   const [sessions, setSessions] = React.useState<SessionItem[]>([]);
   const [projects, setProjects] = React.useState<ProjectEntry[]>([]);
+  // Employees without a WeChat binding — drives the red pill on the
+  // Team nav entry. Refreshed when the team page broadcasts
+  // fastclaw:channels-changed after a successful QR scan.
+  const [unboundCount, setUnboundCount] = React.useState(0);
   // Single dialog state covers both entry points: the agent-scoped
   // footer button (full Agent + User tabs) and the platform-nav
   // Settings entry (User tabs only). `settingsUserOnly` picks the mode.
@@ -181,6 +196,37 @@ export function AppSidebar(props: React.ComponentProps<typeof Sidebar>) {
         setAgentRoles(roles);
       })
       .catch(() => {});
+  }, []);
+
+  // Unbound-employee count for the Team red dot. One channels fetch per
+  // agent, so cap the fan-out — the nudge targets small boss accounts
+  // (1-3 employees); an admin browsing dozens of agents doesn't need it.
+  React.useEffect(() => {
+    let aborted = false;
+    const refetch = async () => {
+      try {
+        const list = await getAgents();
+        if (aborted || list.length === 0 || list.length > 20) {
+          if (!aborted) setUnboundCount(0);
+          return;
+        }
+        const channelLists = await Promise.all(
+          list.map((a) => listAgentChannels(a.id).catch(() => [])),
+        );
+        if (aborted) return;
+        setUnboundCount(
+          channelLists.filter((chs) => !chs.some((c) => c.type === "wechat"))
+            .length,
+        );
+      } catch {}
+    };
+    refetch();
+    const onChange = () => refetch();
+    window.addEventListener("fastclaw:channels-changed", onChange);
+    return () => {
+      aborted = true;
+      window.removeEventListener("fastclaw:channels-changed", onChange);
+    };
   }, []);
 
   // When the active agent isn't in the caller's owned list — e.g. a
@@ -286,7 +332,10 @@ export function AppSidebar(props: React.ComponentProps<typeof Sidebar>) {
         : [],
     [t, activeAgentId, pathname, hasOpenSession],
   );
-  const overviewItems = React.useMemo(() => [OVERVIEW_ITEM(t)], [t]);
+  const overviewItems = React.useMemo(
+    () => [TEAM_ITEM(t, unboundCount), OVERVIEW_ITEM(t)],
+    [t, unboundCount],
+  );
   const agentGroupItems = React.useMemo(
     () => (isAdmin ? ADMIN_AGENT_GROUP(t) : USER_AGENT_GROUP(t)),
     [t, isAdmin],

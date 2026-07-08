@@ -84,7 +84,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
         const me = await getMe();
         if (me.ok && me.user) {
           if (isAdminPath(pathname) && me.user.role !== "super_admin") {
-            router.replace("/overview/");
+            router.replace("/team/");
             return;
           }
           setAuthed(true);

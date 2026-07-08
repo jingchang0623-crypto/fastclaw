@@ -32,7 +32,7 @@ export default function RootPage() {
         }
         const me = await getMe().catch(() => null);
         if (me?.ok && me.user) {
-          router.replace("/overview/");
+          router.replace("/team/");
         } else {
           setShowLogin(true);
           setLoading(false);
@@ -54,7 +54,7 @@ export default function RootPage() {
         setError(res.error || t("errorInvalidCredentials"));
         return;
       }
-      router.replace("/overview/");
+      router.replace("/team/");
     } catch {
       setError(t("errorConnectionFailed"));
     } finally {

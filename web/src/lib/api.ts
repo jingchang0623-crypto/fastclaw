@@ -817,6 +817,34 @@ export async function getAgentKnowledgeFile(
   return (await res.json()) as { name: string; storedName: string; path: string; content: string; size: number; hash?: string };
 }
 
+// Agent system files (IDENTITY.md / USER.md / SOUL.md …) — the
+// allowlisted markdown pair the runtime injects into the prompt. The
+// team dashboard reads IDENTITY.md for the role blurb and USER.md to
+// tell whether the onboarding interview has produced anything yet.
+// source: "db" (caller override) | "owner" | "default" (unset → empty
+// content).
+export interface AgentSystemFile {
+  content: string;
+  source: "db" | "owner" | "default";
+  baseContent?: string;
+}
+
+export async function getAgentSystemFile(
+  agentId: string,
+  name: string,
+): Promise<AgentSystemFile> {
+  const res = await apiFetch(
+    `/api/agents/${encodeURIComponent(agentId)}/system-files/${encodeURIComponent(name)}`,
+  );
+  if (!res.ok) return { content: "", source: "default" };
+  const data = await res.json().catch(() => ({}));
+  return {
+    content: typeof data?.content === "string" ? data.content : "",
+    source: data?.source === "db" || data?.source === "owner" ? data.source : "default",
+    baseContent: typeof data?.baseContent === "string" ? data.baseContent : undefined,
+  };
+}
+
 // Chat
 export interface ChatHistoryMessage {
   role: "user" | "assistant" | "tool";

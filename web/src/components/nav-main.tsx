@@ -26,6 +26,9 @@ export interface NavItem {
   // onClick replaces the default router.push when present. Used for
   // items that open a dialog instead of navigating.
   onClick?: () => void;
+  // badge renders a red count pill after the title — the "N employees
+  // still unbound" nudge on the Team entry. 0/undefined hides it.
+  badge?: number;
 }
 
 function isActive(pathname: string, href: string) {
@@ -85,6 +88,11 @@ export function NavMain({
               >
                 <item.icon />
                 <span>{item.title}</span>
+                {!!item.badge && (
+                  <span className="ml-auto inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-red-500 px-1.5 text-[10px] font-semibold text-white">
+                    {item.badge}
+                  </span>
+                )}
               </SidebarMenuButton>
             </SidebarMenuItem>
           );
