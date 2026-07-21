@@ -299,15 +299,14 @@ func registerWeChatChannels(rec store.ConfigRecord, chCfg config.ChannelConfig, 
 		if err != nil {
 			return err
 		}
-		// On confirmed token-expiry the adapter exits; clean up the
-		// configs row so the next process restart doesn't re-register
-		// a known-dead bot (which would log the same warning again on
-		// boot). The user has to rescan the QR through the dashboard
-		// — that flow re-creates the Accounts entry from scratch.
+		// On confirmed token-expiry the adapter exits. Preserve the channel
+		// row for the dashboard, but disable it and stamp a machine-readable
+		// health state so the owner gets a re-scan action instead of a bot
+		// that still appears connected.
 		if st != nil {
 			rowID := rec.ID
 			wc.SetOnExpired(func(deadAccount string) {
-				if err := purgeWeChatAccount(st, rowID, deadAccount); err != nil {
+				if err := expireWeChatAccount(st, rowID, deadAccount); err != nil {
 					slog.Warn("wechat token-expired cleanup failed",
 						"account", deadAccount, "error", err)
 				}
@@ -317,6 +316,27 @@ func registerWeChatChannels(rec store.ConfigRecord, chCfg config.ChannelConfig, 
 		registerSingleton(chanMgr, wc, hot)
 	}
 	return nil
+}
+
+func expireWeChatAccount(st store.Store, legacyRowID, deadAccount string) error {
+	ctx := context.Background()
+	ch, err := st.LookupChannel(ctx, "wechat", deadAccount)
+	if err == nil && ch != nil {
+		ch.Enabled = false
+		if ch.Data == nil {
+			ch.Data = make(map[string]interface{})
+		}
+		ch.Data["healthStatus"] = "expired"
+		ch.Data["healthError"] = "微信登录已失效，请重新扫码绑定"
+		ch.Data["expiredAt"] = time.Now().UTC().Format(time.RFC3339)
+		return st.SaveChannel(ctx, ch)
+	}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	// Pre-channels-table installs still use configs. Keep the legacy
+	// cleanup path until all deployments have migrated.
+	return purgeWeChatAccount(st, legacyRowID, deadAccount)
 }
 
 // purgeWeChatAccount removes one account from the configs row's
@@ -361,4 +381,3 @@ func purgeWeChatAccount(st store.Store, rowID, deadAccount string) error {
 	rec.Data = data
 	return st.SaveConfig(ctx, rec)
 }
-

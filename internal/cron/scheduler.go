@@ -60,6 +60,7 @@ type StoreInterface interface {
 // fires every due job blindly (legacy behaviour).
 type ChannelChecker interface {
 	Has(channel, accountID string) bool
+	CanSend(channel, accountID, chatID string) error
 }
 
 // cronMaxConsecutiveFailures is the threshold at which a cron row gets
@@ -241,38 +242,34 @@ func (s *Scheduler) processDueJobs(ctx context.Context) {
 			continue
 		}
 
-		// Pre-flight: if the destination IM channel adapter isn't
-		// registered (e.g. the bot token died and the gateway tore
-		// it down), there's no point queuing the inbound — the
-		// agent's reply would just hit "unknown outbound channel"
-		// and be dropped. Instead, bump the failure counter; after
-		// cronMaxConsecutiveFailures consecutive misses, delete
-		// the row so the scheduler stops re-trying forever.
+		// Pre-flight: if the destination IM adapter is absent or cannot
+		// currently send to this chat, don't spend model tokens producing
+		// an answer that the channel will drop. WeChat additionally checks
+		// its conversation-scoped context token here.
 		// "web" is the dashboard SSE, "api" is the HTTP completions
 		// endpoint — both are always reachable (replies go through
 		// the plugin's channel.send, not an IM adapter). Empty
 		// channel is a legacy row that doesn't route through any bot.
 		if s.channels != nil && j.Channel != "" && j.Channel != "web" && j.Channel != "api" {
-			if !s.channels.Has(j.Channel, j.AccountID) {
+			readinessErr := s.channels.CanSend(j.Channel, j.AccountID, j.ChatID)
+			if readinessErr != nil {
 				count, ferr := s.store.IncrementCronJobFailure(ctx, j.ID)
 				if ferr != nil {
 					slog.Error("failed to bump cron failure count", "id", j.ID, "error", ferr)
 					continue
 				}
-				if count >= cronMaxConsecutiveFailures {
-					slog.Warn("auto-deleting cron job — destination channel missing for too many consecutive ticks",
-						"id", j.ID, "name", j.Name,
-						"channel", j.Channel, "account", j.AccountID,
-						"failures", count)
-					if derr := s.store.DeleteCronJob(ctx, j.ID); derr != nil {
-						slog.Error("failed to delete dead cron job", "id", j.ID, "error", derr)
-					}
-					continue
+				// IncrementCronJobFailure releases the lock but deliberately does
+				// not advance next_run. Advance it now so a daily report does not
+				// hot-loop and get deleted merely because WeChat needs the owner
+				// to reactivate the 24-hour conversation window.
+				next := nextRunAfterMiss(j, now)
+				if err := s.store.UpdateCronJobRun(ctx, j.ID, now, next); err != nil {
+					slog.Error("failed to defer undeliverable cron job", "id", j.ID, "error", err)
 				}
-				slog.Warn("cron destination channel missing, skipping fire",
+				slog.Warn("cron destination unavailable, skipping model turn",
 					"id", j.ID, "name", j.Name,
 					"channel", j.Channel, "account", j.AccountID,
-					"failures", count, "threshold", cronMaxConsecutiveFailures)
+					"failures", count, "next_run", next, "reason", readinessErr)
 				continue
 			}
 		}
@@ -333,6 +330,21 @@ func (s *Scheduler) processDueJobs(ctx context.Context) {
 			_ = s.store.UpdateCronJobRun(ctx, j.ID, now, now.Add(time.Hour))
 		}
 	}
+}
+
+func nextRunAfterMiss(j StoreJob, now time.Time) time.Time {
+	switch j.Type {
+	case "interval":
+		sched := strings.TrimPrefix(j.Schedule, "every ")
+		if dur, err := time.ParseDuration(sched); err == nil {
+			return now.Add(dur)
+		}
+	case "cron":
+		return NextOccurrenceIn(j.Schedule, now, LocationOf(j.Timezone))
+	}
+	// One-shot reminders remain recoverable instead of disappearing while
+	// the user is disconnected. Retry hourly until the channel is active.
+	return now.Add(time.Hour)
 }
 
 func (s *Scheduler) runJob(ctx context.Context, job Job) {

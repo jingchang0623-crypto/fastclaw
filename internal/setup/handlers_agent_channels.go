@@ -34,10 +34,13 @@ import (
 type channelOut struct {
 	Type           string `json:"type"`
 	AccountID      string `json:"accountId"`
-	BotUsername     string `json:"botUsername,omitempty"`
+	BotUsername    string `json:"botUsername,omitempty"`
 	BotToken       string `json:"botToken"` // masked
 	Enabled        bool   `json:"enabled"`
 	SharedIdentity bool   `json:"sharedIdentity"`
+	HealthStatus   string `json:"healthStatus,omitempty"`
+	HealthError    string `json:"healthError,omitempty"`
+	ExpiredAt      string `json:"expiredAt,omitempty"`
 	UpdatedAt      string `json:"updatedAt,omitempty"`
 	Source         string `json:"source,omitempty"`
 }
@@ -212,6 +215,9 @@ func flattenChannelRecords(rows []store.ChannelRecord, source string) []channelO
 				BotToken:       maskAPIKey(rec.BotToken),
 				Enabled:        rec.Enabled,
 				SharedIdentity: rec.SharedIdentity,
+				HealthStatus:   channelDataString(rec.Data, "healthStatus"),
+				HealthError:    channelDataString(rec.Data, "healthError"),
+				ExpiredAt:      channelDataString(rec.Data, "expiredAt"),
 				UpdatedAt:      rec.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 				Source:         source,
 			})
@@ -225,16 +231,27 @@ func flattenChannelRecords(rows []store.ChannelRecord, source string) []channelO
 			out = append(out, channelOut{
 				Type:           rec.Type,
 				AccountID:      accountID,
-				BotUsername:     accountID,
+				BotUsername:    accountID,
 				BotToken:       maskAPIKey(tok),
 				Enabled:        rec.Enabled,
 				SharedIdentity: rec.SharedIdentity,
+				HealthStatus:   channelDataString(rec.Data, "healthStatus"),
+				HealthError:    channelDataString(rec.Data, "healthError"),
+				ExpiredAt:      channelDataString(rec.Data, "expiredAt"),
 				UpdatedAt:      rec.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 				Source:         source,
 			})
 		}
 	}
 	return out
+}
+
+func channelDataString(data map[string]interface{}, key string) string {
+	if data == nil {
+		return ""
+	}
+	v, _ := data[key].(string)
+	return v
 }
 
 type connectTelegramRequest struct {
@@ -1235,11 +1252,11 @@ func (s *Server) handleConnectAgentLINE(w http.ResponseWriter, r *http.Request) 
 		s.hotRegisterChannelRecord(*ch)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"botUserId":   userID,
-		"botName":     displayName,
-		"basicId":     basicID,
-		"webhookUrl":  lineWebhookPathFor(r, userID),
+		"ok":         true,
+		"botUserId":  userID,
+		"botName":    displayName,
+		"basicId":    basicID,
+		"webhookUrl": lineWebhookPathFor(r, userID),
 	})
 }
 
@@ -1269,6 +1286,8 @@ func (s *Server) saveChannelRecord(ctx context.Context, userID, agentID, channel
 		return nil
 	}
 	data := channelConfigToData(cc)
+	data["healthStatus"] = "connected"
+	data["connectedAt"] = time.Now().UTC().Format(time.RFC3339)
 	ch := &store.ChannelRecord{
 		UserID:    userID,
 		AgentID:   agentID,

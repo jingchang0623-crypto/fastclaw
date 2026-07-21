@@ -2,6 +2,7 @@ package channels
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -19,6 +20,10 @@ type Manager struct {
 	// Web fanout, plugin channels) are not present in the map and run
 	// their Start unconditionally on every replica.
 	singleton map[string]struct{}
+	// cancels owns one child context per running channel. Unlike the old
+	// implementation, Unregister can now actually stop a polling adapter
+	// (and its lease retry loop) without restarting the whole gateway.
+	cancels map[string]context.CancelFunc
 	// tgTokens tracks Telegram bot tokens already claimed by this
 	// process so we never start two pollers on the same token (they'd
 	// fight over the long-poll lock and spam 409 Conflict forever).
@@ -56,6 +61,7 @@ func NewManagerWithLeaser(mb *bus.MessageBus, leaser Leaser, holderID string) *M
 	return &Manager{
 		channels:  make(map[string]Channel),
 		singleton: make(map[string]struct{}),
+		cancels:   make(map[string]context.CancelFunc),
 		tgTokens:  make(map[string]struct{}),
 		bus:       mb,
 		leaser:    leaser,
@@ -125,11 +131,20 @@ func (m *Manager) RegisterSingletonAndStart(ch Channel) {
 func (m *Manager) registerAndStart(ch Channel, singleton bool) {
 	m.mu.Lock()
 	key := channelKey(ch.Name(), ch.AccountID())
+	if cancel := m.cancels[key]; cancel != nil {
+		cancel()
+		delete(m.cancels, key)
+	}
 	m.channels[key] = ch
 	if singleton {
 		m.singleton[key] = struct{}{}
+	} else {
+		delete(m.singleton, key)
 	}
 	ctx := m.rootCtx
+	if ctx != nil {
+		ctx, m.cancels[key] = context.WithCancel(ctx)
+	}
 	leaser := m.leaser
 	holderID := m.holderID
 	m.mu.Unlock()
@@ -159,7 +174,13 @@ func (m *Manager) registerAndStart(ch Channel, singleton bool) {
 func (m *Manager) Unregister(channelType, accountID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.channels, channelKey(channelType, accountID))
+	key := channelKey(channelType, accountID)
+	delete(m.channels, key)
+	delete(m.singleton, key)
+	if cancel := m.cancels[key]; cancel != nil {
+		cancel()
+		delete(m.cancels, key)
+	}
 }
 
 // Start launches all channels and the outbound message router.
@@ -168,9 +189,13 @@ func (m *Manager) Start(ctx context.Context) {
 	m.rootCtx = ctx
 	chans := make(map[string]Channel, len(m.channels))
 	singletons := make(map[string]bool, len(m.channels))
+	runContexts := make(map[string]context.Context, len(m.channels))
 	for k, v := range m.channels {
 		chans[k] = v
 		_, singletons[k] = m.singleton[k]
+		childCtx, cancel := context.WithCancel(ctx)
+		m.cancels[k] = cancel
+		runContexts[k] = childCtx
 	}
 	leaser := m.leaser
 	holderID := m.holderID
@@ -188,18 +213,19 @@ func (m *Manager) Start(ctx context.Context) {
 	// Start each channel
 	for key, ch := range chans {
 		singleton := singletons[key]
+		channelCtx := runContexts[key]
 		wg.Add(1)
-		go func(k string, c Channel, s bool) {
+		go func(runCtx context.Context, k string, c Channel, s bool) {
 			defer wg.Done()
 			slog.Info("starting channel", "key", k, "singleton", s)
 			if s {
-				runWithLease(ctx, c, leaser, holderID)
+				runWithLease(runCtx, c, leaser, holderID)
 				return
 			}
-			if err := c.Start(ctx); err != nil {
+			if err := c.Start(runCtx); err != nil {
 				slog.Error("channel stopped with error", "key", k, "error", err)
 			}
-		}(key, ch, singleton)
+		}(channelCtx, key, ch, singleton)
 	}
 
 	wg.Wait()
@@ -313,6 +339,24 @@ func (m *Manager) Has(channel, accountID string) bool {
 	defer m.mu.Unlock()
 	_, ok := m.channels[channelKey(channel, accountID)]
 	return ok
+}
+
+// CanSend verifies that an adapter exists and, when it exposes a
+// destination-level readiness check, that the destination can accept a
+// proactive message right now. WeChat uses this to enforce iLink's
+// short-lived context-token window before a cron turn spends model tokens.
+func (m *Manager) CanSend(channel, accountID, chatID string) error {
+	key := channelKey(channel, accountID)
+	m.mu.Lock()
+	ch, ok := m.channels[key]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("channel %s is not registered", key)
+	}
+	if ready, ok := ch.(interface{ CanSend(string) error }); ok {
+		return ready.CanSend(chatID)
+	}
+	return nil
 }
 
 // Get returns the registered adapter for (channel, accountID), or nil.

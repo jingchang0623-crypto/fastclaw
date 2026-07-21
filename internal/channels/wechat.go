@@ -93,7 +93,22 @@ const (
 	// graduate to a real buf, short enough that a truly revoked token
 	// doesn't loop forever.
 	wechatEmptyBufExpiredThreshold = 20
+	// iLink context_token is a conversation-scoped capability with an
+	// approximately 24-hour send window. Keep a small safety margin so a
+	// cron does not start an expensive model turn with a token that will
+	// expire before the answer is ready.
+	wechatContextTokenMaxAge = 23*time.Hour + 50*time.Minute
 )
+
+type wechatContextTokenState struct {
+	Token      string    `json:"token"`
+	ReceivedAt time.Time `json:"received_at"`
+}
+
+type wechatPersistedState struct {
+	GetUpdatesBuf string                             `json:"get_updates_buf"`
+	ContextTokens map[string]wechatContextTokenState `json:"context_tokens,omitempty"`
+}
 
 // WeChat is the iLink long-poll adapter for one logged-in WeChat bot.
 type WeChat struct {
@@ -132,7 +147,7 @@ type WeChat struct {
 	// way back. Empty string is allowed (getconfig has it as optional)
 	// — the cache is best-effort, not a hard prerequisite.
 	ctxTokensMu sync.Mutex
-	ctxTokens   map[string]string
+	ctxTokens   map[string]wechatContextTokenState
 
 	// onExpired fires once when the iLink server has confirmed the bot
 	// token is dead (operator must rescan). Set by the gateway so it
@@ -165,7 +180,7 @@ func NewWeChat(botToken, baseURL, ilinkUserID, accountID string, mb *bus.Message
 		ilinkUserID: ilinkUserID,
 		httpClient:  &http.Client{},
 		wechatUIN:   wechatGenerateUIN(),
-		ctxTokens:   make(map[string]string),
+		ctxTokens:   make(map[string]wechatContextTokenState),
 		bufPath:     wechatBufPath(accountID),
 	}, nil
 }
@@ -203,15 +218,18 @@ func (w *WeChat) loadBuf() {
 		}
 		return
 	}
-	var s struct {
-		GetUpdatesBuf string `json:"get_updates_buf"`
-	}
+	var s wechatPersistedState
 	if err := json.Unmarshal(data, &s); err != nil {
 		slog.Warn("wechat loadBuf parse failed — discarding",
 			"account", w.accountID, "path", w.bufPath, "error", err)
 		return
 	}
 	w.getUpdatesBuf = s.GetUpdatesBuf
+	w.ctxTokensMu.Lock()
+	for chatID, token := range s.ContextTokens {
+		w.ctxTokens[chatID] = token
+	}
+	w.ctxTokensMu.Unlock()
 	if s.GetUpdatesBuf != "" {
 		slog.Info("wechat loaded persisted sync buf",
 			"account", w.accountID, "path", w.bufPath)
@@ -231,9 +249,16 @@ func (w *WeChat) saveBuf() {
 			"account", w.accountID, "path", w.bufPath, "error", err)
 		return
 	}
-	data, _ := json.Marshal(struct {
-		GetUpdatesBuf string `json:"get_updates_buf"`
-	}{GetUpdatesBuf: w.getUpdatesBuf})
+	w.ctxTokensMu.Lock()
+	contexts := make(map[string]wechatContextTokenState, len(w.ctxTokens))
+	for chatID, token := range w.ctxTokens {
+		contexts[chatID] = token
+	}
+	w.ctxTokensMu.Unlock()
+	data, _ := json.Marshal(wechatPersistedState{
+		GetUpdatesBuf: w.getUpdatesBuf,
+		ContextTokens: contexts,
+	})
 	if err := os.WriteFile(w.bufPath, data, 0o600); err != nil {
 		slog.Warn("wechat saveBuf write failed",
 			"account", w.accountID, "path", w.bufPath, "error", err)
@@ -256,6 +281,26 @@ func (w *WeChat) clearBuf() {
 func (w *WeChat) Name() string        { return "wechat" }
 func (w *WeChat) AccountID() string   { return w.accountID }
 func (w *WeChat) BotUsername() string { return w.accountID }
+
+// CanSend reports whether chatID has a fresh conversation capability for a
+// proactive send. Normal replies always refresh this state from the inbound
+// message first; scheduled jobs call this before invoking the model.
+func (w *WeChat) CanSend(chatID string) error {
+	w.ctxTokensMu.Lock()
+	state, ok := w.ctxTokens[chatID]
+	w.ctxTokensMu.Unlock()
+	if !ok || state.Token == "" || state.ReceivedAt.IsZero() {
+		return fmt.Errorf("wechat conversation is not activated; user must message the bot first")
+	}
+	age := time.Since(state.ReceivedAt)
+	if age < 0 {
+		age = 0
+	}
+	if age > wechatContextTokenMaxAge {
+		return fmt.Errorf("wechat conversation token expired after %s; user must message the bot again", age.Round(time.Minute))
+	}
+	return nil
+}
 
 // Start runs the long-poll loop until ctx is cancelled. Mirrors the
 // retry / session-recovery semantics of the upstream weclaw monitor:
@@ -461,8 +506,11 @@ func (w *WeChat) dispatchInbound(m wechatMessage) {
 	// — the freshest token is the most likely to validate.
 	if m.FromUserID != "" {
 		w.ctxTokensMu.Lock()
-		w.ctxTokens[m.FromUserID] = m.ContextToken
+		w.ctxTokens[m.FromUserID] = wechatContextTokenState{
+			Token: m.ContextToken, ReceivedAt: time.Now().UTC(),
+		}
 		w.ctxTokensMu.Unlock()
+		w.saveBuf()
 	}
 
 	w.bus.Inbound <- bus.InboundMessage{
@@ -546,7 +594,7 @@ func (w *WeChat) SendMessage(msg bus.OutboundMessage) error {
 // path can carry its own timeout + payload shape.
 func (w *WeChat) sendTextOnly(chatID, plain string) error {
 	w.ctxTokensMu.Lock()
-	contextToken := w.ctxTokens[chatID]
+	contextToken := w.ctxTokens[chatID].Token
 	w.ctxTokensMu.Unlock()
 
 	body := wechatSendRequest{
@@ -594,7 +642,7 @@ func (w *WeChat) SendTyping(chatID string) error {
 		return nil
 	}
 	w.ctxTokensMu.Lock()
-	contextToken := w.ctxTokens[chatID]
+	contextToken := w.ctxTokens[chatID].Token
 	w.ctxTokensMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), wechatTypingTimeout)
@@ -953,7 +1001,7 @@ func (w *WeChat) sendMedia(chatID string, item bus.MediaItem) error {
 	}
 
 	w.ctxTokensMu.Lock()
-	contextToken := w.ctxTokens[chatID]
+	contextToken := w.ctxTokens[chatID].Token
 	w.ctxTokensMu.Unlock()
 
 	media := &wechatMediaInfo{
