@@ -20,7 +20,7 @@ func newTestWeChat(mb *bus.MessageBus, server *httptest.Server) *WeChat {
 		accountID:  "bot_1",
 		httpClient: server.Client(),
 		cdnBaseURL: server.URL,
-		ctxTokens:  make(map[string]string),
+		ctxTokens:  make(map[string]wechatContextTokenState),
 	}
 }
 
