@@ -103,11 +103,16 @@ const (
 	// cron does not start an expensive model turn with a token that will
 	// expire before the answer is ready.
 	wechatContextTokenMaxAge = 23*time.Hour + 50*time.Minute
+	wechatEngagementDelay    = 18 * time.Hour
+	wechatMeaningfulGap      = 6 * time.Hour
+	wechatEngagementCheck    = time.Minute
 )
 
 type wechatContextTokenState struct {
-	Token      string    `json:"token"`
-	ReceivedAt time.Time `json:"received_at"`
+	Token            string    `json:"token"`
+	ReceivedAt       time.Time `json:"received_at"`
+	LastOutboundAt   time.Time `json:"last_outbound_at,omitempty"`
+	LastEngagementAt time.Time `json:"last_engagement_at,omitempty"`
 }
 
 type wechatPersistedState struct {
@@ -159,13 +164,21 @@ type WeChat struct {
 	// token is dead (operator must rescan). Set by the gateway so it
 	// can disable the configs row + unregister the adapter; without it
 	// the loop would log the same warning every 5s forever.
-	onExpired func(accountID string)
+	onExpired       func(accountID string)
+	onEngagementDue func(accountID, chatID string)
 }
 
 // SetOnExpired registers a callback that fires when the bot token is
 // confirmed dead. The callback runs once; Start exits afterwards.
 func (w *WeChat) SetOnExpired(fn func(accountID string)) {
 	w.onExpired = fn
+}
+
+// SetOnEngagementDue enables one proactive, agent-generated interaction
+// before the current iLink conversation capability reaches its 24-hour
+// boundary. Leaving it nil keeps the feature disabled for safe rollout.
+func (w *WeChat) SetOnEngagementDue(fn func(accountID, chatID string)) {
+	w.onEngagementDue = fn
 }
 
 // NewWeChat creates a new WeChat channel adapter from a connected
@@ -309,6 +322,91 @@ func (w *WeChat) CanSend(chatID string) error {
 	return nil
 }
 
+func (w *WeChat) markOutbound(chatID string, at time.Time) {
+	w.ctxTokensMu.Lock()
+	state, ok := w.ctxTokens[chatID]
+	if ok {
+		state.LastOutboundAt = at
+		w.ctxTokens[chatID] = state
+	}
+	w.ctxTokensMu.Unlock()
+	if ok {
+		w.saveBuf()
+	}
+}
+
+// engagementDueAt aims for 18 hours after the user's last message. When
+// that falls in quiet hours, move it earlier to 21:00 rather than later —
+// delaying can cross iLink's 24-hour send boundary.
+func engagementDueAt(received time.Time, loc *time.Location) time.Time {
+	if loc == nil {
+		loc = time.Local
+	}
+	due := received.In(loc).Add(wechatEngagementDelay)
+	if due.Hour() >= 23 || due.Hour() < 8 {
+		due = time.Date(due.Year(), due.Month(), due.Day(), 21, 0, 0, 0, loc)
+		if due.After(received.In(loc).Add(wechatEngagementDelay)) {
+			due = due.AddDate(0, 0, -1)
+		}
+	}
+	minimum := received.In(loc).Add(8 * time.Hour)
+	if due.Before(minimum) {
+		due = minimum
+	}
+	return due.UTC()
+}
+
+func (w *WeChat) engagementLoop(ctx context.Context) {
+	ticker := time.NewTicker(wechatEngagementCheck)
+	defer ticker.Stop()
+	w.fireDueEngagements(time.Now().UTC())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			w.fireDueEngagements(now.UTC())
+		}
+	}
+}
+
+func (w *WeChat) fireDueEngagements(now time.Time) {
+	var dueChats []string
+	changed := false
+	w.ctxTokensMu.Lock()
+	for chatID, state := range w.ctxTokens {
+		if state.Token == "" || state.ReceivedAt.IsZero() ||
+			!state.LastEngagementAt.Before(state.ReceivedAt) {
+			continue
+		}
+		// A delayed outbound (for example the nightly CEO report) already
+		// counts as this cycle's interaction. Immediate replies to the
+		// inbound do not, hence the six-hour meaningful-gap threshold.
+		if !state.LastOutboundAt.Before(state.ReceivedAt.Add(wechatMeaningfulGap)) {
+			state.LastEngagementAt = state.LastOutboundAt
+			w.ctxTokens[chatID] = state
+			changed = true
+			continue
+		}
+		if now.Before(engagementDueAt(state.ReceivedAt, time.Local)) ||
+			now.After(state.ReceivedAt.Add(wechatContextTokenMaxAge)) {
+			continue
+		}
+		state.LastEngagementAt = now
+		w.ctxTokens[chatID] = state
+		dueChats = append(dueChats, chatID)
+		changed = true
+	}
+	w.ctxTokensMu.Unlock()
+	if changed {
+		w.saveBuf()
+	}
+	for _, chatID := range dueChats {
+		slog.Info("wechat proactive engagement due", "account", w.accountID, "chat", chatID)
+		w.onEngagementDue(w.accountID, chatID)
+	}
+}
+
 // Start runs the long-poll loop until ctx is cancelled. Mirrors the
 // retry / session-recovery semantics of the upstream weclaw monitor:
 //   - any GetUpdates error → exponential backoff up to 60s
@@ -317,6 +415,9 @@ func (w *WeChat) CanSend(chatID string) error {
 //     (operator needs to re-scan).
 func (w *WeChat) Start(ctx context.Context) error {
 	w.loadBuf()
+	if w.onEngagementDue != nil {
+		go w.engagementLoop(ctx)
+	}
 	slog.Info("wechat long-poll loop starting",
 		"account", w.accountID, "buf_present", w.getUpdatesBuf != "")
 	for {
@@ -667,6 +768,7 @@ func (w *WeChat) sendTextOnly(chatID, plain string) error {
 	if resp.Ret != 0 {
 		return fmt.Errorf("wechat send: ret=%d errmsg=%s", resp.Ret, resp.ErrMsg)
 	}
+	w.markOutbound(chatID, time.Now().UTC())
 	return nil
 }
 

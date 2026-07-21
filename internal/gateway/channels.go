@@ -313,6 +313,23 @@ func registerWeChatChannels(rec store.ConfigRecord, chCfg config.ChannelConfig, 
 				chanMgr.Unregister("wechat", deadAccount)
 			})
 		}
+		if enabled, _ := rec.Data["proactiveEngagementEnabled"].(bool); enabled {
+			ownerID, agentID := rec.UserID, rec.AgentID
+			wc.SetOnEngagementDue(func(activeAccount, chatID string) {
+				mb.Inbound <- bus.InboundMessage{
+					Channel:     "wechat",
+					AccountID:   activeAccount,
+					ChatID:      chatID,
+					UserID:      chatID,
+					OwnerUserID: ownerID,
+					AgentID:     agentID,
+					PeerKind:    "dm",
+					Source:      bus.SourceCron,
+					Text: "[老板主动关怀任务] 距离老板上次主动联系已接近一天。请结合你掌握的老板背景、近期对话、目标和待办，发起一次简短但有实际价值的互动。" +
+						"不要泛泛问候，不要虚构新信息；可以提供一个观察、提醒或复盘角度，并以一个容易直接回答的具体问题结尾。控制在 120 字以内。",
+				}
+			})
+		}
 		registerSingleton(chanMgr, wc, hot)
 	}
 	return nil
