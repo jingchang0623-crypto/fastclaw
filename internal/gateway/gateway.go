@@ -664,6 +664,8 @@ func (g *Gateway) Run() error {
 	go func() { defer wg.Done(); g.processInbound(ctx) }()
 	wg.Add(1)
 	go func() { defer wg.Done(); g.chanMgr.Start(ctx) }()
+	wg.Add(1)
+	go func() { defer wg.Done(); g.reconcileChannelRegistrations(ctx) }()
 	if g.scheduler != nil {
 		wg.Add(1)
 		go func() { defer wg.Done(); g.scheduler.Start(ctx) }()
@@ -705,6 +707,56 @@ func (g *Gateway) Run() error {
 	}
 	slog.Info("gateway stopped")
 	return nil
+}
+
+// reconcileChannelRegistrations is a production safety net for polling
+// channels. The normal boot path registers every enabled row before
+// Manager.Start, but an interrupted migration or a bad deployment must not
+// leave persisted WeChat/Telegram accounts silently disconnected until the
+// next user visits the dashboard. Reconcile immediately after startup and
+// periodically thereafter; Manager.Has keeps this idempotent.
+func (g *Gateway) reconcileChannelRegistrations(ctx context.Context) {
+	reconcile := func() {
+		rows, err := g.store.ListAllChannels(ctx)
+		if err != nil {
+			slog.Warn("channel reconciliation list failed", "error", err)
+			return
+		}
+		for _, row := range rows {
+			if !row.Enabled || g.chanMgr.Has(row.Type, row.AccountID) {
+				continue
+			}
+			slog.Warn("recovering missing enabled channel registration",
+				"type", row.Type, "account", row.AccountID, "user", row.UserID, "agent", row.AgentID)
+			if err := registerChannelFromRecord(row, g.bus, g.chanMgr, g.store, true); err != nil {
+				slog.Error("channel reconciliation register failed",
+					"type", row.Type, "account", row.AccountID, "error", err)
+			}
+		}
+	}
+
+	// Manager.Start captures its root context before this goroutine is
+	// scheduled in normal operation. A short delay also avoids noisy duplicate
+	// diagnostics while all boot goroutines settle.
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+		reconcile()
+	}
+
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconcile()
+		}
+	}
 }
 
 // makeStoreFirstAgentFileLoader returns a loader that reads per-agent
@@ -803,23 +855,23 @@ func readSystemSandboxCfg(st store.Store) config.SandboxCfg {
 // with kind="setting". Adding a new namespace is a one-line append; the
 // scope.Setting / SettingInto helpers handle merging across scopes.
 const (
-	NSAgentDefaults  = "agents.defaults"
-	NSSandbox        = "sandbox"
-	NSObjectStore    = "objectstore"
-	NSHooks          = "hooks"
-	NSPlugins        = "plugins"
-	NSTaskQueue      = "taskqueue"
-	NSToolProviders  = "tools.providers"
-	NSToolCategories = "tools.categories"
-	NSSkillsInstall  = "skills.install"
-	NSSkillsEntries  = "skills.entries"
-	NSMemory         = "memory"
+	NSAgentDefaults    = "agents.defaults"
+	NSSandbox          = "sandbox"
+	NSObjectStore      = "objectstore"
+	NSHooks            = "hooks"
+	NSPlugins          = "plugins"
+	NSTaskQueue        = "taskqueue"
+	NSToolProviders    = "tools.providers"
+	NSToolCategories   = "tools.categories"
+	NSSkillsInstall    = "skills.install"
+	NSSkillsEntries    = "skills.entries"
+	NSMemory           = "memory"
 	NSWorkspaceHistory = "workspaceHistory"
-	NSPrivacy        = "privacy"
-	NSSkillsLearner  = "skillsLearner"
-	NSHeartbeat      = "heartbeat"
-	NSTeams          = "teams"
-	NSBindings       = "bindings"
+	NSPrivacy          = "privacy"
+	NSSkillsLearner    = "skillsLearner"
+	NSHeartbeat        = "heartbeat"
+	NSTeams            = "teams"
+	NSBindings         = "bindings"
 )
 
 // registerChannelsFromStore loads every enabled channel from the
