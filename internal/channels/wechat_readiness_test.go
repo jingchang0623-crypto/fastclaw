@@ -67,9 +67,10 @@ func TestFireDueEngagementsDeduplicatesDelayedReport(t *testing.T) {
 		accountID: "boss-bot",
 		ctxTokens: map[string]wechatContextTokenState{
 			"boss": {
-				Token:          "valid",
-				ReceivedAt:     received,
-				LastOutboundAt: received.Add(8 * time.Hour),
+				Token:                     "valid",
+				ReceivedAt:                received,
+				LastOutboundAt:            received.Add(8 * time.Hour),
+				LastInteractiveOutboundAt: received.Add(8 * time.Hour),
 			},
 		},
 	}
@@ -81,5 +82,26 @@ func TestFireDueEngagementsDeduplicatesDelayedReport(t *testing.T) {
 	}
 	if w.ctxTokens["boss"].LastEngagementAt.IsZero() {
 		t.Fatal("delayed report was not persisted as this cycle's engagement")
+	}
+}
+
+func TestFireDueEngagementsDoesNotCountOneWayReport(t *testing.T) {
+	now := time.Now().UTC()
+	received := now.Add(-19 * time.Hour)
+	w := &WeChat{
+		accountID: "boss-bot",
+		ctxTokens: map[string]wechatContextTokenState{
+			"boss": {
+				Token:          "valid",
+				ReceivedAt:     received,
+				LastOutboundAt: received.Add(8 * time.Hour),
+			},
+		},
+	}
+	var calls int
+	w.SetOnEngagementDue(func(string, string) { calls++ })
+	w.fireDueEngagements(now)
+	if calls != 1 {
+		t.Fatalf("engagement calls = %d, want one-way report not to suppress interaction", calls)
 	}
 }

@@ -109,10 +109,11 @@ const (
 )
 
 type wechatContextTokenState struct {
-	Token            string    `json:"token"`
-	ReceivedAt       time.Time `json:"received_at"`
-	LastOutboundAt   time.Time `json:"last_outbound_at,omitempty"`
-	LastEngagementAt time.Time `json:"last_engagement_at,omitempty"`
+	Token                     string    `json:"token"`
+	ReceivedAt                time.Time `json:"received_at"`
+	LastOutboundAt            time.Time `json:"last_outbound_at,omitempty"`
+	LastInteractiveOutboundAt time.Time `json:"last_interactive_outbound_at,omitempty"`
+	LastEngagementAt          time.Time `json:"last_engagement_at,omitempty"`
 }
 
 type wechatPersistedState struct {
@@ -322,11 +323,14 @@ func (w *WeChat) CanSend(chatID string) error {
 	return nil
 }
 
-func (w *WeChat) markOutbound(chatID string, at time.Time) {
+func (w *WeChat) markOutbound(chatID string, at time.Time, interactive bool) {
 	w.ctxTokensMu.Lock()
 	state, ok := w.ctxTokens[chatID]
 	if ok {
 		state.LastOutboundAt = at
+		if interactive {
+			state.LastInteractiveOutboundAt = at
+		}
 		w.ctxTokens[chatID] = state
 	}
 	w.ctxTokensMu.Unlock()
@@ -382,8 +386,8 @@ func (w *WeChat) fireDueEngagements(now time.Time) {
 		// A delayed outbound (for example the nightly CEO report) already
 		// counts as this cycle's interaction. Immediate replies to the
 		// inbound do not, hence the six-hour meaningful-gap threshold.
-		if !state.LastOutboundAt.Before(state.ReceivedAt.Add(wechatMeaningfulGap)) {
-			state.LastEngagementAt = state.LastOutboundAt
+		if !state.LastInteractiveOutboundAt.Before(state.ReceivedAt.Add(wechatMeaningfulGap)) {
+			state.LastEngagementAt = state.LastInteractiveOutboundAt
 			w.ctxTokens[chatID] = state
 			changed = true
 			continue
@@ -768,7 +772,7 @@ func (w *WeChat) sendTextOnly(chatID, plain string) error {
 	if resp.Ret != 0 {
 		return fmt.Errorf("wechat send: ret=%d errmsg=%s", resp.Ret, resp.ErrMsg)
 	}
-	w.markOutbound(chatID, time.Now().UTC())
+	w.markOutbound(chatID, time.Now().UTC(), strings.ContainsAny(plain, "?？"))
 	return nil
 }
 
