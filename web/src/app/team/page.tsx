@@ -41,6 +41,8 @@ interface TeamMember {
   duty: string; // one-liner from IDENTITY.md (fallback: description)
   interviewed: boolean; // USER.md non-empty = onboarding interview has output
   wechatBound: boolean;
+  wechatExpired: boolean;
+  wechatHealthError: string;
   latestReport: string; // last assistant message text, "" when none
   reportedToday: boolean;
   detailsLoaded: boolean;
@@ -131,7 +133,13 @@ export default function TeamPage() {
         listAgentChannels(agent.id).catch(() => []),
         getChatSessions(agent.id).catch(() => []),
       ]);
-      const wechatBound = channels.some((c) => c.type === "wechat");
+      const wechat = channels.filter((c) => c.type === "wechat");
+      const wechatBound = wechat.some(
+        (c) => c.enabled && c.healthStatus !== "expired",
+      );
+      const expiredWechat = wechat.find(
+        (c) => c.healthStatus === "expired" || !c.enabled,
+      );
       // Latest activity = session with max updatedAt; its last assistant
       // message is the freshest "report". History rows carry no per-
       // message timestamp, so "reported today" approximates via the
@@ -153,6 +161,8 @@ export default function TeamPage() {
         duty: extractDuty(identity.content) || agent.description || "",
         interviewed: userFile.content.trim().length > 0,
         wechatBound,
+        wechatExpired: !wechatBound && !!expiredWechat,
+        wechatHealthError: expiredWechat?.healthError || "",
         latestReport,
         reportedToday,
         detailsLoaded: true,
@@ -175,6 +185,8 @@ export default function TeamPage() {
             duty: agent.description || "",
             interviewed: false,
             wechatBound: false,
+            wechatExpired: false,
+            wechatHealthError: "",
             latestReport: "",
             reportedToday: false,
             detailsLoaded: false,
@@ -206,7 +218,14 @@ export default function TeamPage() {
   const handleBound = useCallback((agentId: string) => {
     setMembers((prev) =>
       prev.map((m) =>
-        m.agent.id === agentId ? { ...m, wechatBound: true } : m,
+        m.agent.id === agentId
+          ? {
+              ...m,
+              wechatBound: true,
+              wechatExpired: false,
+              wechatHealthError: "",
+            }
+          : m,
       ),
     );
     broadcastChannelsChanged();
@@ -302,7 +321,7 @@ function StatusBadge({ member }: { member: TeamMember }) {
     return (
       <span className="inline-flex items-center gap-1.5 rounded-full bg-red-500/10 px-2.5 py-0.5 text-xs font-medium text-red-600 dark:text-red-400">
         <span className="h-1.5 w-1.5 rounded-full bg-red-500" />
-        {t("badgeUnbound")}
+        {member.wechatExpired ? t("badgeExpired") : t("badgeUnbound")}
       </span>
     );
   }
@@ -356,12 +375,23 @@ function MemberCard({
       {member.wechatBound ? (
         <BoundBody member={member} />
       ) : member.detailsLoaded ? (
-        <UnboundBody
-          agent={agent}
-          qrOpen={qrOpen}
-          onToggleQr={onToggleQr}
-          onBound={onBound}
-        />
+        <div className="space-y-3">
+          {member.wechatExpired && (
+            <div className="rounded-md border border-red-500/30 bg-red-500/5 p-3 text-sm text-red-700 dark:text-red-400">
+              <p className="font-medium">{t("sessionExpiredTitle")}</p>
+              <p className="mt-1 text-xs opacity-90">
+                {member.wechatHealthError || t("sessionExpiredHint")}
+              </p>
+            </div>
+          )}
+          <UnboundBody
+            agent={agent}
+            qrOpen={qrOpen}
+            onToggleQr={onToggleQr}
+            onBound={onBound}
+            reconnect={member.wechatExpired}
+          />
+        </div>
       ) : (
         <Skeleton className="h-16" />
       )}
@@ -411,11 +441,13 @@ function UnboundBody({
   qrOpen,
   onToggleQr,
   onBound,
+  reconnect,
 }: {
   agent: AgentDetail;
   qrOpen: boolean;
   onToggleQr: () => void;
   onBound: () => void;
+  reconnect: boolean;
 }) {
   const t = useTranslations("team");
   type WechatStatus = "wait" | "scaned" | "confirmed" | "expired" | "";
@@ -488,7 +520,7 @@ function UnboundBody({
     return (
       <Button onClick={onToggleQr} className="w-full">
         <QrCode className="h-4 w-4 mr-1.5" />
-        {t("bindAction")}
+        {reconnect ? t("rebindAction") : t("bindAction")}
       </Button>
     );
   }

@@ -1777,6 +1777,9 @@ export interface AgentChannel {
   botToken: string;    // server-masked
   enabled: boolean;
   sharedIdentity: boolean;
+  healthStatus?: "connected" | "expired" | string;
+  healthError?: string;
+  expiredAt?: string;
   updatedAt?: string;
 }
 

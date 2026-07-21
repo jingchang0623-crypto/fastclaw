@@ -11,3 +11,6 @@ onlyBuiltDependencies:
   - msw
   - sharp
   - unrs-resolver
+overrides:
+  'ip-address@<10.1.1': '>=10.1.1'
+  'postcss@<8.5.10': '>=8.5.10'
